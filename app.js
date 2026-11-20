@@ -5,7 +5,8 @@ const GMB_BASE = 'https://data.etagmb.gov.hk';
 const CO_NAMES = {
   KMB: '九巴',
   CTB: '城巴',
-  GMB: '專線小巴'
+  GMB: '專線小巴',
+  JOINT: '九巴+城巴'
 };
 
 const DEFAULT_QUICK_ROUTES = [
@@ -22,7 +23,7 @@ const AREA_KEYWORDS = {
   telford: ['telford', '德福', '九龍灣站', '九龍灣鐵路站']
 };
 
-const REFRESH_SECONDS = 10;
+const REFRESH_SECONDS = 30;
 
 const savedFavs = JSON.parse(localStorage.getItem('hk_bus_favs') || '[]').map((f) => ({
   ...f,
@@ -55,6 +56,13 @@ function esc(str) {
   return String(str || '').replace(/[&<>"']/g, (m) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   }[m]));
+}
+
+function renderBadgesHtml(co) {
+  if (co === 'JOINT') {
+    return `<div class="badge-group"><span class="badge badge-KMB">九巴</span><span class="badge badge-CTB">城巴</span></div>`;
+  }
+  return `<span class="badge badge-${co}">${CO_NAMES[co] || co}</span>`;
 }
 
 function saveFavs() {
@@ -126,6 +134,19 @@ async function fetchJson(url) {
   return res.json();
 }
 
+async function ensureCtbStops(stopIds) {
+  const missing = [...new Set(stopIds)].filter((id) => id && !state.ctbStopCache[id]);
+  if (missing.length === 0) return;
+  await Promise.allSettled(
+    missing.map((id) =>
+      fetchJson(`${CTB_BASE}/stop/${id}`).then((r) => {
+        if (r.data) state.ctbStopCache[id] = r.data;
+      })
+    )
+  );
+  try { localStorage.setItem('hk_ctb_stops', JSON.stringify(state.ctbStopCache)); } catch (_) {}
+}
+
 // --- 初始化路線及車站資料 ---
 async function initData() {
   try {
@@ -166,24 +187,27 @@ async function initData() {
 }
 
 // --- 整理並按時間排序 ETA ---
-function processBusEtas(rawList, bound) {
-  const dirFiltered = (rawList || []).filter((x) => !bound || x.dir === bound);
-
-  const timed = dirFiltered
-    .filter((x) => x.eta)
+function extractTimedEtas(rawList, bound, opTag = '') {
+  return (rawList || [])
+    .filter((x) => (!bound || x.dir === bound) && x.eta)
     .map((x) => ({
       ts: new Date(x.eta).getTime(),
       min: calcMinutes(x.eta),
       clock: formatClock(x.eta),
-      rmk: x.rmk_tc || ''
+      rmk: x.rmk_tc || '',
+      op: opTag
     }))
-    .filter((x) => !Number.isNaN(x.ts) && x.min >= -1)
+    .filter((x) => !Number.isNaN(x.ts) && x.min >= -1);
+}
+
+function processBusEtas(rawList, bound) {
+  const timed = extractTimedEtas(rawList, bound)
     .sort((a, b) => a.ts - b.ts)
     .slice(0, 3);
 
   if (timed.length > 0) return timed;
 
-  const remarkOnly = dirFiltered.find((x) => x.rmk_tc);
+  const remarkOnly = (rawList || []).find((x) => (!bound || x.dir === bound) && x.rmk_tc);
   if (remarkOnly) {
     return [{ min: null, clock: '', rmk: remarkOnly.rmk_tc }];
   }
@@ -192,6 +216,40 @@ function processBusEtas(rawList, bound) {
 
 // --- 獲取到站預報 ETA ---
 async function fetchFavEta(fav) {
+  if (fav.co === 'JOINT') {
+    const reqs = [];
+    if (fav.kmbStopId) {
+      reqs.push(
+        fetchJson(`${KMB_BASE}/eta/${fav.kmbStopId}/${fav.route}/${fav.serviceType || '1'}`)
+          .then((r) => ({ op: 'KMB', bound: fav.kmbBound, data: r.data || [] }))
+      );
+    }
+    if (fav.ctbStopId) {
+      reqs.push(
+        fetchJson(`${CTB_BASE}/eta/ctb/${fav.ctbStopId}/${fav.route}`)
+          .then((r) => ({ op: 'CTB', bound: fav.ctbBound, data: r.data || [] }))
+      );
+    }
+
+    const settled = await Promise.allSettled(reqs);
+    let combinedTimed = [];
+    let fallbackRemarks = [];
+
+    settled.forEach((res) => {
+      if (res.status !== 'fulfilled') return;
+      const { op, bound, data } = res.value;
+      const timed = extractTimedEtas(data, bound, op);
+      combinedTimed = combinedTimed.concat(timed);
+      const rmk = data.find((x) => (!bound || x.dir === bound) && x.rmk_tc);
+      if (rmk) fallbackRemarks.push({ min: null, clock: '', rmk: rmk.rmk_tc, op });
+    });
+
+    if (combinedTimed.length > 0) {
+      return combinedTimed.sort((a, b) => a.ts - b.ts).slice(0, 3);
+    }
+    return fallbackRemarks.slice(0, 1);
+  }
+
   if (fav.co === 'KMB') {
     const res = await fetchJson(`${KMB_BASE}/eta/${fav.stopId}/${fav.route}/${fav.serviceType || '1'}`);
     return processBusEtas(res.data, fav.bound);
@@ -223,13 +281,18 @@ function renderEtaPills(etas) {
     return `<div class="eta-row"><span class="dest-text">暫無班次資料</span></div>`;
   }
   return `<div class="eta-row">${etas.map((e) => {
+    const opBadge = e.op === 'KMB'
+      ? `<span class="op-tag op-KMB">九</span>`
+      : (e.op === 'CTB' ? `<span class="op-tag op-CTB">城</span>` : '');
+
     if (e.min === null || Number.isNaN(e.min)) {
-      return `<div class="eta-pill"><span class="eta-rmk">${esc(e.rmk || '未有資料')}</span></div>`;
+      return `<div class="eta-pill">${opBadge}<span class="eta-rmk">${esc(e.rmk || '未有資料')}</span></div>`;
     }
     const isDue = e.min <= 1;
     const minLabel = isDue ? '即將到站' : `${e.min} 分鐘`;
     return `
       <div class="eta-pill">
+        ${opBadge}
         <span class="eta-min ${isDue ? 'due' : ''}">${minLabel}</span>
         <span class="eta-time">${esc(e.clock)}</span>
         ${e.rmk ? `<span class="eta-rmk">${esc(e.rmk)}</span>` : ''}
@@ -261,7 +324,7 @@ async function renderFavorites() {
     <div class="card" id="fav-${esc(fav.id)}">
       <div class="card-header">
         <div class="route-num">
-          <span class="badge badge-${fav.co}">${CO_NAMES[fav.co] || fav.co}</span>
+          ${renderBadgesHtml(fav.co)}
           <div style="margin-top:4px;">${esc(fav.route)}</div>
         </div>
         <div class="route-meta">
@@ -386,6 +449,90 @@ function renderQuickRouteChips() {
   });
 }
 
+// --- 聯營路線配對 (九巴 + 城巴) ---
+async function tryPairJointRoutes(kmbItems, ctbItems) {
+  if (kmbItems.length === 0 || ctbItems.length === 0 || state.kmbStopMap.size === 0) {
+    return null;
+  }
+
+  // 載入每個 KMB 方向車站及 CTB 首/中/尾車站座標
+  await Promise.allSettled([
+    ...kmbItems.map(async (k) => {
+      const dirStr = k.bound === 'O' ? 'outbound' : 'inbound';
+      const res = await fetchJson(`${KMB_BASE}/route-stop/${k.route}/${dirStr}/${k.serviceType}`);
+      k.rawStops = res.data || [];
+    }),
+    ensureCtbStops(ctbItems.flatMap((c) => {
+      const s = c.rawStops || [];
+      if (s.length === 0) return [];
+      return [s[0].stop, s[Math.floor(s.length / 2)].stop, s[s.length - 1].stop];
+    }))
+  ]);
+
+  const stopDist = (kStopId, cStopId) => {
+    const ks = state.kmbStopMap.get(kStopId);
+    const cs = state.ctbStopCache[cStopId];
+    if (!ks || !cs) return Infinity;
+    return haversineMeters(ks.a, ks.o, parseFloat(cs.lat), parseFloat(cs.long));
+  };
+
+  const merged = [];
+  const usedCtb = new Set();
+
+  kmbItems.forEach((k) => {
+    const ks = k.rawStops || [];
+    if (k.serviceType !== '1' || ks.length === 0) {
+      merged.push(k);
+      return;
+    }
+
+    let bestCtb = null;
+    let bestScore = Infinity;
+
+    ctbItems.forEach((c, cIdx) => {
+      if (usedCtb.has(cIdx)) return;
+      const cs = c.rawStops || [];
+      if (cs.length === 0) return;
+
+      const dStart = stopDist(ks[0].stop, cs[0].stop);
+      const dMid = stopDist(ks[Math.floor(ks.length / 2)].stop, cs[Math.floor(cs.length / 2)].stop);
+      const dEnd = stopDist(ks[ks.length - 1].stop, cs[cs.length - 1].stop);
+
+      if (dStart < 1200 && dMid < 1200 && dEnd < 1200) {
+        const score = dStart + dMid + dEnd;
+        if (score < bestScore) {
+          bestScore = score;
+          bestCtb = { c, cIdx };
+        }
+      }
+    });
+
+    if (bestCtb) {
+      usedCtb.add(bestCtb.cIdx);
+      merged.push({
+        co: 'JOINT',
+        route: k.route,
+        kmbBound: k.bound,
+        serviceType: k.serviceType,
+        ctbBound: bestCtb.c.bound,
+        kmbStops: ks,
+        ctbStops: bestCtb.c.rawStops,
+        origTc: k.origTc,
+        destTc: k.destTc,
+        extra: '九巴 + 城巴聯營（合併實時到站時間）'
+      });
+    } else {
+      merged.push(k);
+    }
+  });
+
+  ctbItems.forEach((c, cIdx) => {
+    if (!usedCtb.has(cIdx)) merged.push(c);
+  });
+
+  return merged;
+}
+
 // --- 搜尋路線 ---
 async function searchRoute(rawQuery) {
   const q = rawQuery.trim().toUpperCase();
@@ -393,13 +540,15 @@ async function searchRoute(rawQuery) {
   if (!q) return;
   out.innerHTML = `<div class="empty-state">正在搜尋「${esc(q)}」…</div>`;
 
-  const results = [];
+  const kmbItems = [];
+  const ctbItems = [];
+  const gmbItems = [];
 
   // 1. 九巴
   state.kmbRoutes
     .filter((r) => r.route === q)
     .forEach((r) => {
-      results.push({
+      kmbItems.push({
         co: 'KMB',
         route: r.route,
         bound: r.bound,
@@ -418,7 +567,7 @@ async function searchRoute(rawQuery) {
       fetchJson(`${CTB_BASE}/route-stop/ctb/${q}/inbound`)
     ]);
     if (outStops.status === 'fulfilled' && (outStops.value.data || []).length > 0) {
-      results.push({
+      ctbItems.push({
         co: 'CTB', route: q, bound: 'O', direction: 'outbound',
         origTc: ctbMatch.orig_tc || ctbMatch.orig_en,
         destTc: ctbMatch.dest_tc || ctbMatch.dest_en,
@@ -426,7 +575,7 @@ async function searchRoute(rawQuery) {
       });
     }
     if (inStops.status === 'fulfilled' && (inStops.value.data || []).length > 0) {
-      results.push({
+      ctbItems.push({
         co: 'CTB', route: q, bound: 'I', direction: 'inbound',
         origTc: ctbMatch.dest_tc || ctbMatch.dest_en,
         destTc: ctbMatch.orig_tc || ctbMatch.orig_en,
@@ -435,7 +584,14 @@ async function searchRoute(rawQuery) {
     }
   }
 
-  // 3. 專線小巴 (若背景清單未載入，直接嘗試向九龍/新界/港島查詢)
+  // 若九巴及城巴同時營運，自動合併方向
+  let busResults = [...kmbItems, ...ctbItems];
+  if (kmbItems.length > 0 && ctbItems.length > 0) {
+    const paired = await tryPairJointRoutes(kmbItems, ctbItems);
+    if (paired) busResults = paired;
+  }
+
+  // 3. 專線小巴
   const regionLabel = { KLN: '九龍', NT: '新界', HKI: '港島' };
   const gmbRegions = state.gmbLoaded
     ? ['KLN', 'NT', 'HKI'].filter((reg) => state.gmbRoutes[reg].has(q))
@@ -448,7 +604,7 @@ async function searchRoute(rawQuery) {
         const res = await fetchJson(`${GMB_BASE}/route/${reg}/${q}`);
         (res.data || []).forEach((variant) => {
           (variant.directions || []).forEach((dir) => {
-            results.push({
+            gmbItems.push({
               co: 'GMB',
               region: reg,
               route: q,
@@ -466,6 +622,8 @@ async function searchRoute(rawQuery) {
     })
   );
 
+  const results = [...busResults, ...gmbItems];
+
   let html = '';
   if (results.length === 0) {
     html = `<div class="empty-state">找不到路線「${esc(q)}」。<br/>請確認路線號碼（例如 <b>5A</b>、<b>22M</b>、<b>107</b>、<b>88</b>），或該路線暫未納入政府實時開放數據。</div>`;
@@ -474,7 +632,7 @@ async function searchRoute(rawQuery) {
       <div class="card" style="cursor:pointer;" data-route-idx="${idx}">
         <div class="card-header">
           <div class="route-num">
-            <span class="badge badge-${item.co}">${CO_NAMES[item.co]}</span>
+            ${renderBadgesHtml(item.co)}
             <div style="margin-top:4px;">${esc(item.route)}</div>
           </div>
           <div class="route-meta">
@@ -503,16 +661,70 @@ async function openRouteStopsModal(routeObj) {
   const title = document.getElementById('modalTitle');
   const body = document.getElementById('modalBody');
 
-  title.innerHTML = `<span class="badge badge-${routeObj.co}">${CO_NAMES[routeObj.co]}</span> ${esc(routeObj.route)} 往 ${esc(routeObj.destTc)}`;
+  title.innerHTML = `<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">${renderBadgesHtml(routeObj.co)} <span>${esc(routeObj.route)} 往 ${esc(routeObj.destTc)}</span></div>`;
   body.innerHTML = `<div class="empty-state">正在載入沿途車站…</div>`;
   backdrop.classList.add('open');
 
   try {
     let stops = [];
-    if (routeObj.co === 'KMB') {
-      const dirStr = routeObj.bound === 'O' ? 'outbound' : 'inbound';
-      const res = await fetchJson(`${KMB_BASE}/route-stop/${routeObj.route}/${dirStr}/${routeObj.serviceType}`);
-      stops = (res.data || []).map((rs) => {
+
+    if (routeObj.co === 'JOINT') {
+      const kStops = routeObj.kmbStops || [];
+      const cStops = routeObj.ctbStops || [];
+      await ensureCtbStops(cStops.map((s) => s.stop));
+
+      const matchedCtbIndices = new Set();
+      stops = kStops.map((ks, kIdx) => {
+        const kInfo = state.kmbStopMap.get(ks.stop) || {};
+        let bestCIdx = -1;
+        let bestDist = 250; // 250m 以內視為同一個聯營車站
+
+        if (kInfo.a && kInfo.o) {
+          cStops.forEach((cs, cIdx) => {
+            if (matchedCtbIndices.has(cIdx)) return;
+            const cInfo = state.ctbStopCache[cs.stop];
+            if (!cInfo) return;
+            const d = haversineMeters(kInfo.a, kInfo.o, parseFloat(cInfo.lat), parseFloat(cInfo.long));
+            if (d < bestDist) {
+              bestDist = d;
+              bestCIdx = cIdx;
+            }
+          });
+        }
+
+        let ctbStopId = null;
+        if (bestCIdx >= 0) {
+          matchedCtbIndices.add(bestCIdx);
+          ctbStopId = cStops[bestCIdx].stop;
+        }
+
+        return {
+          seq: ks.seq || (kIdx + 1),
+          kmbStopId: ks.stop,
+          ctbStopId,
+          nameTc: kInfo.t || kInfo.e || ks.stop
+        };
+      });
+
+      // 若城巴有額外獨有車站，亦保留在清單尾部供選擇
+      cStops.forEach((cs, cIdx) => {
+        if (matchedCtbIndices.has(cIdx)) return;
+        const cInfo = state.ctbStopCache[cs.stop] || {};
+        stops.push({
+          seq: stops.length + 1,
+          kmbStopId: null,
+          ctbStopId: cs.stop,
+          nameTc: `${cInfo.name_tc || cInfo.name_en || cs.stop} (城巴站)`
+        });
+      });
+    } else if (routeObj.co === 'KMB') {
+      let raw = routeObj.rawStops;
+      if (!raw) {
+        const dirStr = routeObj.bound === 'O' ? 'outbound' : 'inbound';
+        const res = await fetchJson(`${KMB_BASE}/route-stop/${routeObj.route}/${dirStr}/${routeObj.serviceType}`);
+        raw = res.data || [];
+      }
+      stops = raw.map((rs) => {
         const info = state.kmbStopMap.get(rs.stop) || {};
         return {
           seq: rs.seq,
@@ -522,17 +734,7 @@ async function openRouteStopsModal(routeObj) {
       });
     } else if (routeObj.co === 'CTB') {
       const raw = routeObj.rawStops || [];
-      const missing = raw.map((s) => s.stop).filter((id) => !state.ctbStopCache[id]);
-      if (missing.length > 0) {
-        await Promise.allSettled(
-          missing.map((id) =>
-            fetchJson(`${CTB_BASE}/stop/${id}`).then((r) => {
-              if (r.data) state.ctbStopCache[id] = r.data;
-            })
-          )
-        );
-        try { localStorage.setItem('hk_ctb_stops', JSON.stringify(state.ctbStopCache)); } catch (_) {}
-      }
+      await ensureCtbStops(raw.map((s) => s.stop));
       stops = raw.map((rs) => {
         const info = state.ctbStopCache[rs.stop] || {};
         return {
@@ -556,12 +758,18 @@ async function openRouteStopsModal(routeObj) {
       return fav.group === 'home' ? '★ 屋企' : '★ 出街';
     };
 
-    body.innerHTML = stops.map((st, idx) => {
-      const favId = routeObj.co === 'GMB'
-        ? `GMB-${routeObj.routeId}-${routeObj.routeSeq}-${st.stopSeq}`
-        : `${routeObj.co}-${routeObj.route}-${routeObj.bound}-${routeObj.serviceType || '1'}-${st.stopId}`;
-      const existing = findFav(favId);
+    const buildFavId = (st) => {
+      if (routeObj.co === 'JOINT') {
+        return `JOINT-${routeObj.route}-${routeObj.kmbBound}-${routeObj.ctbBound}-${st.kmbStopId || ''}-${st.ctbStopId || ''}`;
+      }
+      if (routeObj.co === 'GMB') {
+        return `GMB-${routeObj.routeId}-${routeObj.routeSeq}-${st.stopSeq}`;
+      }
+      return `${routeObj.co}-${routeObj.route}-${routeObj.bound}-${routeObj.serviceType || '1'}-${st.stopId}`;
+    };
 
+    body.innerHTML = stops.map((st, idx) => {
+      const existing = findFav(buildFavId(st));
       return `
         <div class="stop-item" data-stop-idx="${idx}">
           <div class="stop-item-top">
@@ -578,21 +786,32 @@ async function openRouteStopsModal(routeObj) {
     body.querySelectorAll('[data-stop-idx]').forEach((row) => {
       const idx = Number(row.dataset.stopIdx);
       const st = stops[idx];
-      const favObj = {
-        id: routeObj.co === 'GMB'
-          ? `GMB-${routeObj.routeId}-${routeObj.routeSeq}-${st.stopSeq}`
-          : `${routeObj.co}-${routeObj.route}-${routeObj.bound}-${routeObj.serviceType || '1'}-${st.stopId}`,
-        co: routeObj.co,
-        route: routeObj.route,
-        bound: routeObj.bound || '',
-        serviceType: routeObj.serviceType || '1',
-        routeId: routeObj.routeId || '',
-        routeSeq: routeObj.routeSeq || '',
-        stopSeq: st.stopSeq || '',
-        stopId: st.stopId,
-        stopNameTc: st.nameTc,
-        destTc: routeObj.destTc
-      };
+      const favObj = routeObj.co === 'JOINT'
+        ? {
+            id: buildFavId(st),
+            co: 'JOINT',
+            route: routeObj.route,
+            kmbBound: routeObj.kmbBound,
+            serviceType: routeObj.serviceType || '1',
+            kmbStopId: st.kmbStopId,
+            ctbBound: routeObj.ctbBound,
+            ctbStopId: st.ctbStopId,
+            stopNameTc: st.nameTc,
+            destTc: routeObj.destTc
+          }
+        : {
+            id: buildFavId(st),
+            co: routeObj.co,
+            route: routeObj.route,
+            bound: routeObj.bound || '',
+            serviceType: routeObj.serviceType || '1',
+            routeId: routeObj.routeId || '',
+            routeSeq: routeObj.routeSeq || '',
+            stopSeq: st.stopSeq || '',
+            stopId: st.stopId,
+            stopNameTc: st.nameTc,
+            destTc: routeObj.destTc
+          };
 
       const pinBtn = row.querySelector('[data-pin-idx]');
       pinBtn.addEventListener('click', (e) => {
@@ -825,7 +1044,6 @@ document.getElementById('editOrderBtn').addEventListener('click', (e) => {
   renderFavorites();
 });
 
-// 編輯常用路線
 document.getElementById('editQuickRoutesBtn').addEventListener('click', (e) => {
   state.editQuickMode = !state.editQuickMode;
   e.currentTarget.classList.toggle('editing', state.editQuickMode);
@@ -857,7 +1075,6 @@ document.getElementById('resetQuickRoutesBtn').addEventListener('click', () => {
   renderQuickRouteChips();
 });
 
-// 分類選擇彈窗事件
 document.querySelectorAll('[data-pick-group]').forEach((btn) => {
   btn.addEventListener('click', () => {
     if (state.pendingPin) {
@@ -906,7 +1123,6 @@ document.getElementById('refreshBtn').addEventListener('click', () => {
   }
 });
 
-// 每秒倒數計時（每 10 秒自動更新）
 setInterval(() => {
   if (
     document.hidden ||
@@ -924,12 +1140,10 @@ setInterval(() => {
   }
 }, 1000);
 
-// 註冊 Service Worker
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('./sw.js').catch(() => {});
 }
 
-// 啟動
 renderQuickRouteChips();
 renderFavorites();
 initData();

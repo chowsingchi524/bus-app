@@ -1,4 +1,4 @@
-const CACHE_NAME = 'hk-bus-pwa-v4';
+const CACHE_NAME = 'hk-bus-pwa-v5';
 const APP_SHELL = [
   './',
   './index.html',

@@ -9,12 +9,6 @@ const CO_NAMES = {
   JOINT: '九巴+城巴'
 };
 
-const DEFAULT_QUICK_ROUTES = [
-  '5A', '5D', '11X', '14', '15', '22', '22M', '24', '28B',
-  '101', '106', '107', '108', '111', '215X', '297', '608',
-  'A22', 'E23', '88', '49', '51M', '56', '68', '105'
-];
-
 const AREA_KEYWORDS = {
   kaitak: ['kai tak', '啟德', '啓德', '郵輪碼頭', '德朗', '啟晴', '沐安'],
   tokwawan: ['to kwa wan', '土瓜灣', '馬頭圍', '馬頭角', '宋皇臺', '樂民', '木廠'],
@@ -30,12 +24,12 @@ const savedFavs = JSON.parse(localStorage.getItem('hk_bus_favs') || '[]').map((f
   group: f.group === 'home' ? 'home' : 'out'
 }));
 
-const savedQuickRoutes = JSON.parse(localStorage.getItem('hk_quick_routes') || 'null');
+const savedHistory = JSON.parse(localStorage.getItem('hk_search_history') || '[]');
 
 const state = {
   favorites: savedFavs,
-  quickRoutes: Array.isArray(savedQuickRoutes) ? savedQuickRoutes : [...DEFAULT_QUICK_ROUTES],
-  editQuickMode: false,
+  searchHistory: Array.isArray(savedHistory) ? savedHistory : [],
+  editHistoryMode: false,
   activeGroup: localStorage.getItem('hk_active_group') || 'out',
   editMode: false,
   countdown: REFRESH_SECONDS,
@@ -69,8 +63,14 @@ function saveFavs() {
   localStorage.setItem('hk_bus_favs', JSON.stringify(state.favorites));
 }
 
-function saveQuickRoutes() {
-  localStorage.setItem('hk_quick_routes', JSON.stringify(state.quickRoutes));
+function saveSearchHistory() {
+  localStorage.setItem('hk_search_history', JSON.stringify(state.searchHistory));
+}
+
+function recordSearchHistory(route) {
+  state.searchHistory = [route, ...state.searchHistory.filter((r) => r !== route)].slice(0, 20);
+  saveSearchHistory();
+  renderSearchHistoryChips();
 }
 
 function findFav(id) {
@@ -420,27 +420,38 @@ function updateCountdownUI() {
   el.textContent = state.editMode ? '編輯排序模式' : `${state.countdown} 秒後自動更新`;
 }
 
-// --- 常用路線 Chips (可新增及刪除) ---
-function renderQuickRouteChips() {
-  const container = document.getElementById('quickRouteChips');
-  if (state.quickRoutes.length === 0) {
-    container.innerHTML = `<span class="dest-text">未有常用路線，請撳「✎ 編輯」新增。</span>`;
+// --- 搜尋路線記錄 Chips ---
+function renderSearchHistoryChips() {
+  const container = document.getElementById('searchHistoryChips');
+  const actionsEl = document.getElementById('historyActions');
+  const clearBtn = document.getElementById('clearHistoryBtn');
+  const editBtn = document.getElementById('editHistoryBtn');
+
+  if (state.searchHistory.length === 0) {
+    state.editHistoryMode = false;
+    actionsEl.style.display = 'none';
+    container.innerHTML = `<span class="dest-text">暫無搜尋記錄</span>`;
     return;
   }
 
-  container.innerHTML = state.quickRoutes.map((r) => `
-    <button class="chip ${state.editQuickMode ? 'removable' : ''}" data-qroute="${esc(r)}">
-      ${esc(r)} ${state.editQuickMode ? '<span class="chip-del">✕</span>' : ''}
+  actionsEl.style.display = 'flex';
+  clearBtn.style.display = state.editHistoryMode ? 'inline-block' : 'none';
+  editBtn.classList.toggle('editing', state.editHistoryMode);
+  editBtn.textContent = state.editHistoryMode ? '✓ 完成' : '✎ 編輯';
+
+  container.innerHTML = state.searchHistory.map((r) => `
+    <button class="chip ${state.editHistoryMode ? 'removable' : ''}" data-hroute="${esc(r)}">
+      ${esc(r)} ${state.editHistoryMode ? '<span class="chip-del">✕</span>' : ''}
     </button>
   `).join('');
 
-  container.querySelectorAll('[data-qroute]').forEach((btn) => {
+  container.querySelectorAll('[data-hroute]').forEach((btn) => {
     btn.addEventListener('click', () => {
-      const route = btn.dataset.qroute;
-      if (state.editQuickMode) {
-        state.quickRoutes = state.quickRoutes.filter((r) => r !== route);
-        saveQuickRoutes();
-        renderQuickRouteChips();
+      const route = btn.dataset.hroute;
+      if (state.editHistoryMode) {
+        state.searchHistory = state.searchHistory.filter((r) => r !== route);
+        saveSearchHistory();
+        renderSearchHistoryChips();
       } else {
         document.getElementById('routeInput').value = route;
         searchRoute(route);
@@ -455,7 +466,6 @@ async function tryPairJointRoutes(kmbItems, ctbItems) {
     return null;
   }
 
-  // 載入每個 KMB 方向車站及 CTB 首/中/尾車站座標
   await Promise.allSettled([
     ...kmbItems.map(async (k) => {
       const dirStr = k.bound === 'O' ? 'outbound' : 'inbound';
@@ -544,7 +554,6 @@ async function searchRoute(rawQuery) {
   const ctbItems = [];
   const gmbItems = [];
 
-  // 1. 九巴
   state.kmbRoutes
     .filter((r) => r.route === q)
     .forEach((r) => {
@@ -559,7 +568,6 @@ async function searchRoute(rawQuery) {
       });
     });
 
-  // 2. 城巴
   const ctbMatch = state.ctbRoutes.find((r) => r.route === q);
   if (ctbMatch) {
     const [outStops, inStops] = await Promise.allSettled([
@@ -584,14 +592,12 @@ async function searchRoute(rawQuery) {
     }
   }
 
-  // 若九巴及城巴同時營運，自動合併方向
   let busResults = [...kmbItems, ...ctbItems];
   if (kmbItems.length > 0 && ctbItems.length > 0) {
     const paired = await tryPairJointRoutes(kmbItems, ctbItems);
     if (paired) busResults = paired;
   }
 
-  // 3. 專線小巴
   const regionLabel = { KLN: '九龍', NT: '新界', HKI: '港島' };
   const gmbRegions = state.gmbLoaded
     ? ['KLN', 'NT', 'HKI'].filter((reg) => state.gmbRoutes[reg].has(q))
@@ -628,6 +634,7 @@ async function searchRoute(rawQuery) {
   if (results.length === 0) {
     html = `<div class="empty-state">找不到路線「${esc(q)}」。<br/>請確認路線號碼（例如 <b>5A</b>、<b>22M</b>、<b>107</b>、<b>88</b>），或該路線暫未納入政府實時開放數據。</div>`;
   } else {
+    recordSearchHistory(q);
     html = results.map((item, idx) => `
       <div class="card" style="cursor:pointer;" data-route-idx="${idx}">
         <div class="card-header">
@@ -677,7 +684,7 @@ async function openRouteStopsModal(routeObj) {
       stops = kStops.map((ks, kIdx) => {
         const kInfo = state.kmbStopMap.get(ks.stop) || {};
         let bestCIdx = -1;
-        let bestDist = 250; // 250m 以內視為同一個聯營車站
+        let bestDist = 250;
 
         if (kInfo.a && kInfo.o) {
           cStops.forEach((cs, cIdx) => {
@@ -706,7 +713,6 @@ async function openRouteStopsModal(routeObj) {
         };
       });
 
-      // 若城巴有額外獨有車站，亦保留在清單尾部供選擇
       cStops.forEach((cs, cIdx) => {
         if (matchedCtbIndices.has(cIdx)) return;
         const cInfo = state.ctbStopCache[cs.stop] || {};
@@ -1044,35 +1050,16 @@ document.getElementById('editOrderBtn').addEventListener('click', (e) => {
   renderFavorites();
 });
 
-document.getElementById('editQuickRoutesBtn').addEventListener('click', (e) => {
-  state.editQuickMode = !state.editQuickMode;
-  e.currentTarget.classList.toggle('editing', state.editQuickMode);
-  e.currentTarget.textContent = state.editQuickMode ? '✓ 完成' : '✎ 編輯';
-  document.getElementById('quickEditBar').classList.toggle('open', state.editQuickMode);
-  renderQuickRouteChips();
+// 編輯 / 清除搜尋路線記錄
+document.getElementById('editHistoryBtn').addEventListener('click', () => {
+  state.editHistoryMode = !state.editHistoryMode;
+  renderSearchHistoryChips();
 });
 
-function addQuickRoute() {
-  const input = document.getElementById('newQuickRouteInput');
-  const val = input.value.trim().toUpperCase();
-  if (!val) return;
-  if (!state.quickRoutes.includes(val)) {
-    state.quickRoutes.push(val);
-    saveQuickRoutes();
-    renderQuickRouteChips();
-  }
-  input.value = '';
-}
-
-document.getElementById('addQuickRouteBtn').addEventListener('click', addQuickRoute);
-document.getElementById('newQuickRouteInput').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') addQuickRoute();
-});
-
-document.getElementById('resetQuickRoutesBtn').addEventListener('click', () => {
-  state.quickRoutes = [...DEFAULT_QUICK_ROUTES];
-  saveQuickRoutes();
-  renderQuickRouteChips();
+document.getElementById('clearHistoryBtn').addEventListener('click', () => {
+  state.searchHistory = [];
+  saveSearchHistory();
+  renderSearchHistoryChips();
 });
 
 document.querySelectorAll('[data-pick-group]').forEach((btn) => {
@@ -1144,6 +1131,6 @@ if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('./sw.js').catch(() => {});
 }
 
-renderQuickRouteChips();
+renderSearchHistoryChips();
 renderFavorites();
 initData();

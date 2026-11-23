@@ -74,6 +74,10 @@
       color: #052e16;
       border-color: #22c55e;
     }
+    .icon-btn.danger {
+      color: #f87171;
+      border-color: rgba(248, 113, 113, 0.45);
+    }
 
     main { padding: 14px; max-width: 720px; margin: 0 auto; }
     .tab-view { display: none; }
@@ -258,19 +262,18 @@
       justify-content: space-between;
       align-items: center;
       margin: 10px 0 8px;
+      gap: 8px;
     }
     .section-label {
-      font-size: 0.8rem;
+      font-size: 0.82rem;
       color: var(--muted);
       font-weight: 700;
     }
-
-    .quick-edit-bar {
-      display: none;
-      gap: 8px;
-      margin-bottom: 10px;
+    .history-actions {
+      display: flex;
+      gap: 6px;
+      align-items: center;
     }
-    .quick-edit-bar.open { display: flex; }
 
     .chips {
       display: flex;
@@ -534,20 +537,17 @@
       </div>
 
       <div class="section-header-row">
-        <span class="section-label">常用路線（啟德 / 土瓜灣 / 紅磡 / 九龍灣）</span>
-        <button class="icon-btn" id="editQuickRoutesBtn">✎ 編輯</button>
+        <span class="section-label">搜尋路線記錄</span>
+        <div class="history-actions" id="historyActions" style="display:none;">
+          <button class="icon-btn danger" id="clearHistoryBtn" style="display:none;">全部清除</button>
+          <button class="icon-btn" id="editHistoryBtn">✎ 編輯</button>
+        </div>
       </div>
 
-      <div class="quick-edit-bar" id="quickEditBar">
-        <input type="text" id="newQuickRouteInput" placeholder="新增路線，如 108 或 88" autocomplete="off" />
-        <button class="primary-btn" id="addQuickRouteBtn">+ 新增</button>
-        <button class="icon-btn" id="resetQuickRoutesBtn">重設</button>
-      </div>
-
-      <div class="chips" id="quickRouteChips"></div>
+      <div class="chips" id="searchHistoryChips"></div>
 
       <div id="searchResults">
-        <div class="empty-state">請輸入巴士或專線小巴路線號碼，或點擊上方常用路線。</div>
+        <div class="empty-state">請輸入巴士或專線小巴路線號碼搜尋。</div>
       </div>
     </section>
 

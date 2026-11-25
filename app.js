@@ -38,8 +38,10 @@ const state = {
   kmbStopMap: new Map(),
   ctbRoutes: [],
   ctbStopCache: JSON.parse(localStorage.getItem('hk_ctb_stops') || '{}'),
+  gmbStopCache: JSON.parse(localStorage.getItem('hk_gmb_stops') || '{}'),
   gmbRoutes: { KLN: new Set(), NT: new Set(), HKI: new Set() },
   gmbLoaded: false,
+  fares: null,
   activeArea: 'kaitak',
   map: null,
   pendingPin: null
@@ -147,13 +149,128 @@ async function ensureCtbStops(stopIds) {
   try { localStorage.setItem('hk_ctb_stops', JSON.stringify(state.ctbStopCache)); } catch (_) {}
 }
 
-// --- 初始化路線及車站資料 ---
+async function ensureGmbStops(stopIds) {
+  const missing = [...new Set(stopIds)].filter((id) => id && !state.gmbStopCache[id]);
+  if (missing.length === 0) return;
+  await Promise.allSettled(
+    missing.map((id) =>
+      fetchJson(`${GMB_BASE}/stop/${id}`).then((r) => {
+        const wgs = r.data?.coordinates?.wgs84;
+        if (wgs) state.gmbStopCache[id] = { lat: wgs.latitude, long: wgs.longitude };
+      })
+    )
+  );
+  try { localStorage.setItem('hk_gmb_stops', JSON.stringify(state.gmbStopCache)); } catch (_) {}
+}
+
+// --- 車費配對查詢 (from fares.json) ---
+function textMatchScore(a, b) {
+  if (!a || !b) return 0;
+  const clean = (s) => s.replace(/[\s()（）\-－,，.。/]/g, '').replace(/[邨村站總循環線]/g, '');
+  const sa = clean(a), sb = clean(b);
+  if (!sa || !sb) return 0;
+  if (sa === sb) return 100;
+  if (sa.includes(sb) || sb.includes(sa)) return 60;
+  let shared = 0;
+  for (const ch of new Set(sa)) {
+    if (sb.includes(ch)) shared += 1;
+  }
+  return shared;
+}
+
+function getStopCoordsForFare(item) {
+  if (item.co === 'GMB') {
+    const gc = state.gmbStopCache[item.stopId];
+    return gc ? [parseFloat(gc.lat), parseFloat(gc.long)] : null;
+  }
+  if (item.kmbStopId || item.co === 'KMB') {
+    const ks = state.kmbStopMap.get(item.kmbStopId || item.stopId);
+    if (ks) return [ks.a, ks.o];
+  }
+  if (item.ctbStopId || item.co === 'CTB') {
+    const cs = state.ctbStopCache[item.ctbStopId || item.stopId];
+    if (cs) return [parseFloat(cs.lat), parseFloat(cs.long)];
+  }
+  return null;
+}
+
+function lookupFare(item) {
+  if (!state.fares) return null;
+
+  let candidates = [];
+  if (item.co === 'GMB') {
+    const regions = item.region ? [item.region] : ['KLN', 'NT', 'HKI'];
+    for (const reg of regions) {
+      const list = state.fares.gmb?.[`${reg}:${item.route}`];
+      if (list) candidates = candidates.concat(list);
+    }
+  } else {
+    candidates = state.fares.bus?.[item.route] || [];
+    if (item.co === 'KMB') {
+      const filtered = candidates.filter((c) => (c.co || '').includes('KMB') || (c.co || '').includes('LWB'));
+      if (filtered.length > 0) candidates = filtered;
+    } else if (item.co === 'CTB') {
+      const filtered = candidates.filter((c) => (c.co || '').includes('CTB'));
+      if (filtered.length > 0) candidates = filtered;
+    }
+  }
+
+  if (candidates.length === 0) return null;
+
+  const coords = getStopCoordsForFare(item);
+  let bestFare = null;
+  let bestOverall = -Infinity;
+
+  candidates.forEach((c) => {
+    const dirScore = textMatchScore(item.destTc, c.dest);
+    let matchedStop = null;
+    let bestStopDist = 350;
+
+    if (coords) {
+      c.stops.forEach((st) => {
+        const d = haversineMeters(coords[0], coords[1], st[0], st[1]);
+        if (d < bestStopDist) {
+          bestStopDist = d;
+          matchedStop = st;
+        }
+      });
+    } else if (item.co === 'GMB' && item.stopNameTc) {
+      let bestNameScore = 1;
+      c.stops.forEach((st) => {
+        const ns = textMatchScore(item.stopNameTc, st[3] || '');
+        if (ns > bestNameScore) {
+          bestNameScore = ns;
+          matchedStop = st;
+          bestStopDist = 50;
+        }
+      });
+    }
+
+    if (matchedStop && matchedStop[2] !== null) {
+      const score = dirScore * 10 - bestStopDist;
+      if (score > bestOverall) {
+        bestOverall = score;
+        bestFare = matchedStop[2];
+      }
+    }
+  });
+
+  return bestFare;
+}
+
+function formatFare(fare) {
+  if (fare === null || fare === undefined || Number.isNaN(fare)) return '';
+  return `$${Number(fare).toFixed(1).replace(/\.0$/, '')}`;
+}
+
+// --- 初始化路線、車站及車費資料 ---
 async function initData() {
   try {
     const cachedStops = JSON.parse(localStorage.getItem('hk_kmb_stops_v1') || 'null');
     const weekMs = 7 * 24 * 60 * 60 * 1000;
 
     const tasks = [
+      fetchJson('./fares.json').then((f) => { state.fares = f; }).catch(() => {}),
       fetchJson(`${KMB_BASE}/route/`).then((r) => { state.kmbRoutes = r.data || []; }),
       fetchJson(`${CTB_BASE}/route/ctb`).then((r) => { state.ctbRoutes = r.data || []; }),
       Promise.all([
@@ -180,6 +297,16 @@ async function initData() {
 
     await Promise.allSettled(tasks);
     state.kmbStopMap = new Map(state.kmbStops.map((s) => [s.s, s]));
+
+    // 補齊已收藏城巴及小巴站座標以顯示車費
+    await Promise.allSettled([
+      ensureCtbStops(state.favorites.map((f) => f.ctbStopId || (f.co === 'CTB' ? f.stopId : null))),
+      ensureGmbStops(state.favorites.filter((f) => f.co === 'GMB').map((f) => f.stopId))
+    ]);
+
+    if (document.getElementById('tab-home').classList.contains('active') && !state.editMode) {
+      renderFavorites();
+    }
     if (document.getElementById('tab-area').classList.contains('active')) {
       renderAreaStops();
     }
@@ -320,7 +447,9 @@ async function renderFavorites() {
     return;
   }
 
-  container.innerHTML = groupItems.map((fav, idx) => `
+  container.innerHTML = groupItems.map((fav, idx) => {
+    const fareStr = formatFare(lookupFare(fav));
+    return `
     <div class="card" id="fav-${esc(fav.id)}">
       <div class="card-header">
         <div class="route-num">
@@ -331,6 +460,7 @@ async function renderFavorites() {
           <div class="stop-title">${esc(fav.stopNameTc || fav.stopNameEn)}</div>
           <div class="dest-text">往 ${esc(fav.destTc || fav.destEn)}</div>
         </div>
+        ${fareStr ? `<span class="fare-pill">${fareStr}</span>` : ''}
       </div>
       ${state.editMode ? `
         <div class="edit-controls">
@@ -344,8 +474,8 @@ async function renderFavorites() {
       ` : `
         <div class="eta-holder"><div class="eta-row"><span class="dest-text">載入到站時間…</span></div></div>
       `}
-    </div>
-  `).join('');
+    </div>`;
+  }).join('');
 
   if (state.editMode) {
     bindEditControls();
@@ -732,22 +862,14 @@ async function openRouteStopsModal(routeObj) {
       }
       stops = raw.map((rs) => {
         const info = state.kmbStopMap.get(rs.stop) || {};
-        return {
-          seq: rs.seq,
-          stopId: rs.stop,
-          nameTc: info.t || info.e || rs.stop
-        };
+        return { seq: rs.seq, stopId: rs.stop, nameTc: info.t || info.e || rs.stop };
       });
     } else if (routeObj.co === 'CTB') {
       const raw = routeObj.rawStops || [];
       await ensureCtbStops(raw.map((s) => s.stop));
       stops = raw.map((rs) => {
         const info = state.ctbStopCache[rs.stop] || {};
-        return {
-          seq: rs.seq,
-          stopId: rs.stop,
-          nameTc: info.name_tc || info.name_en || rs.stop
-        };
+        return { seq: rs.seq, stopId: rs.stop, nameTc: info.name_tc || info.name_en || rs.stop };
       });
     } else if (routeObj.co === 'GMB') {
       const res = await fetchJson(`${GMB_BASE}/route-stop/${routeObj.routeId}/${routeObj.routeSeq}`);
@@ -774,12 +896,43 @@ async function openRouteStopsModal(routeObj) {
       return `${routeObj.co}-${routeObj.route}-${routeObj.bound}-${routeObj.serviceType || '1'}-${st.stopId}`;
     };
 
+    const buildFavObj = (st) => routeObj.co === 'JOINT'
+      ? {
+          id: buildFavId(st),
+          co: 'JOINT',
+          route: routeObj.route,
+          kmbBound: routeObj.kmbBound,
+          serviceType: routeObj.serviceType || '1',
+          kmbStopId: st.kmbStopId,
+          ctbBound: routeObj.ctbBound,
+          ctbStopId: st.ctbStopId,
+          stopNameTc: st.nameTc,
+          destTc: routeObj.destTc
+        }
+      : {
+          id: buildFavId(st),
+          co: routeObj.co,
+          region: routeObj.region || '',
+          route: routeObj.route,
+          bound: routeObj.bound || '',
+          serviceType: routeObj.serviceType || '1',
+          routeId: routeObj.routeId || '',
+          routeSeq: routeObj.routeSeq || '',
+          stopSeq: st.stopSeq || '',
+          stopId: st.stopId,
+          stopNameTc: st.nameTc,
+          destTc: routeObj.destTc
+        };
+
     body.innerHTML = stops.map((st, idx) => {
-      const existing = findFav(buildFavId(st));
+      const favObj = buildFavObj(st);
+      const existing = findFav(favObj.id);
+      const fareStr = formatFare(lookupFare(favObj));
       return `
         <div class="stop-item" data-stop-idx="${idx}">
           <div class="stop-item-top">
-            <div class="stop-title" style="margin:0;">${st.seq}. ${esc(st.nameTc)}</div>
+            <div class="stop-title" style="margin:0;flex:1;">${st.seq}. ${esc(st.nameTc)}</div>
+            ${fareStr ? `<span class="fare-pill">${fareStr}</span>` : ''}
             <button class="pin-btn ${existing ? 'pinned' : ''}" data-pin-idx="${idx}">
               ${pinButtonLabel(existing)}
             </button>
@@ -791,37 +944,12 @@ async function openRouteStopsModal(routeObj) {
 
     body.querySelectorAll('[data-stop-idx]').forEach((row) => {
       const idx = Number(row.dataset.stopIdx);
-      const st = stops[idx];
-      const favObj = routeObj.co === 'JOINT'
-        ? {
-            id: buildFavId(st),
-            co: 'JOINT',
-            route: routeObj.route,
-            kmbBound: routeObj.kmbBound,
-            serviceType: routeObj.serviceType || '1',
-            kmbStopId: st.kmbStopId,
-            ctbBound: routeObj.ctbBound,
-            ctbStopId: st.ctbStopId,
-            stopNameTc: st.nameTc,
-            destTc: routeObj.destTc
-          }
-        : {
-            id: buildFavId(st),
-            co: routeObj.co,
-            route: routeObj.route,
-            bound: routeObj.bound || '',
-            serviceType: routeObj.serviceType || '1',
-            routeId: routeObj.routeId || '',
-            routeSeq: routeObj.routeSeq || '',
-            stopSeq: st.stopSeq || '',
-            stopId: st.stopId,
-            stopNameTc: st.nameTc,
-            destTc: routeObj.destTc
-          };
+      const favObj = buildFavObj(stops[idx]);
 
       const pinBtn = row.querySelector('[data-pin-idx]');
       pinBtn.addEventListener('click', (e) => {
         e.stopPropagation();
+        if (favObj.co === 'GMB') ensureGmbStops([favObj.stopId]);
         openGroupPicker(favObj, () => {
           const updated = findFav(favObj.id);
           pinBtn.classList.toggle('pinned', !!updated);
@@ -941,7 +1069,12 @@ function displayStopList(stops, container) {
           box.innerHTML = Array.from(rawByRoute.values()).map((g) => {
             const sortedEtas = processBusEtas(g.items, g.dir).slice(0, 2);
             const favId = `KMB-${g.route}-${g.dir}-${g.serviceType}-${stop.s}`;
+            const favObj = {
+              id: favId, co: 'KMB', route: g.route, bound: g.dir, serviceType: g.serviceType,
+              stopId: stop.s, stopNameTc: stop.t || stop.e, destTc: g.destTc
+            };
             const existing = findFav(favId);
+            const fareStr = formatFare(lookupFare(favObj));
             const etaText = sortedEtas.length === 0
               ? '暫無班次'
               : sortedEtas.map((e) => {
@@ -950,18 +1083,16 @@ function displayStopList(stops, container) {
                 }).join('、');
 
             return `
-              <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-top:1px solid rgba(148,163,184,0.15);">
-                <div>
+              <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-top:1px solid rgba(148,163,184,0.15);gap:6px;">
+                <div style="min-width:0;flex:1;">
                   <span class="badge badge-KMB">${esc(g.route)}</span>
-                  <span style="font-size:0.86rem;margin-left:6px;">往 ${esc(g.destTc)}</span>
+                  <span style="font-size:0.86rem;margin-left:5px;">往 ${esc(g.destTc)}</span>
+                  ${fareStr ? `<span style="color:#4ade80;font-size:0.8rem;font-weight:700;margin-left:4px;">${fareStr}</span>` : ''}
                 </div>
-                <div style="display:flex;align-items:center;gap:8px;">
+                <div style="display:flex;align-items:center;gap:8px;flex-shrink:0;">
                   <strong style="color:var(--accent);font-size:0.88rem;">${esc(etaText)}</strong>
                   <button class="pin-btn ${existing ? 'pinned' : ''}"
-                    data-pin-area='${esc(JSON.stringify({
-                      id: favId, co: 'KMB', route: g.route, bound: g.dir, serviceType: g.serviceType,
-                      stopId: stop.s, stopNameTc: stop.t || stop.e, destTc: g.destTc
-                    }))}'>${pinLabel(existing)}</button>
+                    data-pin-area='${esc(JSON.stringify(favObj))}'>${pinLabel(existing)}</button>
                 </div>
               </div>`;
           }).join('');
@@ -1050,7 +1181,6 @@ document.getElementById('editOrderBtn').addEventListener('click', (e) => {
   renderFavorites();
 });
 
-// 編輯 / 清除搜尋路線記錄
 document.getElementById('editHistoryBtn').addEventListener('click', () => {
   state.editHistoryMode = !state.editHistoryMode;
   renderSearchHistoryChips();
@@ -1133,4 +1263,4 @@ if ('serviceWorker' in navigator) {
 
 renderSearchHistoryChips();
 renderFavorites();
-initData();
+initData();initData();
